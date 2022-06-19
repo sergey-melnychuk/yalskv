@@ -3,6 +3,9 @@ name = "yalskv"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# sudo sh -c "echo -1 > /proc/sys/kernel/perf_event_paranoid"
+# sudo sh -c "echo 0 > /proc/sys/kernel/kptr_restrict"
+[profile.release]
+debug = true
 
 [dependencies]

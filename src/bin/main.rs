@@ -1,3 +1,4 @@
+use std::time::SystemTime;
 use yalskv::{kv, Store};
 
 struct StringStore {
@@ -33,6 +34,18 @@ fn main() -> kv::Result<()> {
     println!("{:?}", store.lookup(key)?);
     store.remove(key)?;
     println!("{:?}", store.lookup(key)?);
+
+    const N: u64 = 1000000;
+    let now = SystemTime::now();
+    for _ in 0..N {
+        store.insert(key, val)?;
+        store.remove(key)?;
+    }
+
+    let ms = now.elapsed().unwrap().as_millis() as u64;
+    let op = N * 2 * 1000 / ms;
+    let kb = N * 1000 * (key.len() * 2 + val.len()) as u64 / ms / 1024;
+    println!("n={} ms={} op={} kb={} [k={} v={}]", N, ms, op, kb, key.len(), val.len());
 
     Ok(())
 }
