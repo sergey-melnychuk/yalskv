@@ -1,5 +1,6 @@
-use std::time::SystemTime;
 use yalskv::{kv, Store};
+
+use std::time::SystemTime;
 
 struct StringStore {
     store: Store,
@@ -25,6 +26,8 @@ impl StringStore {
 }
 
 fn main() -> kv::Result<()> {
+    std::fs::create_dir_all("target/db")?;
+
     let mut store = StringStore::new(Store::open("target/db")?);
 
     let key = "https://www.lipsum.com/feed/html";
@@ -45,7 +48,15 @@ fn main() -> kv::Result<()> {
     let ms = now.elapsed().unwrap().as_millis() as u64;
     let op = N * 2 * 1000 / ms;
     let kb = N * 1000 * (key.len() * 2 + val.len()) as u64 / ms / 1024;
-    println!("n={} ms={} op={} kb={} [k={} v={}]", N, ms, op, kb, key.len(), val.len());
+    println!(
+        "n={} ms={} op={} kb={} [k={} v={}]",
+        N,
+        ms,
+        op,
+        kb,
+        key.len(),
+        val.len()
+    );
 
     Ok(())
 }
