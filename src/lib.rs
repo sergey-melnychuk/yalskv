@@ -5,6 +5,8 @@ use std::os::unix::prelude::FileExt;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, fs::File};
 
+pub mod util;
+
 pub mod kv {
 
     #[derive(Debug)]
@@ -88,15 +90,23 @@ impl Store {
         Ok(None)
     }
 
-    fn id_to_path(&self, id: &FileId) -> PathBuf {
-        let name = format!("{:020}.dat", id.0);
+    fn id_to_dir_path(&self, id: &FileId) -> impl AsRef<Path> {
+        self.id_to_path(id, "")
+    }
+
+    fn id_to_dat_path(&self, id: &FileId) -> impl AsRef<Path> {
+        self.id_to_path(id, ".dat")
+    }
+
+    fn id_to_path(&self, id: &FileId, extension: &str) -> impl AsRef<Path> {
+        let name = format!("{:020}{}", id.0, extension);
         let mut path = self.base.clone();
         path.push(&name);
         path
     }
 
     fn id_to_file(&self, id: &FileId) -> kv::Result<StoreFile> {
-        let file = StoreFile::open(*id, self.id_to_path(id))?;
+        let file = StoreFile::open(*id, self.id_to_path(id, ".dat"))?;
         Ok(file)
     }
 
@@ -107,12 +117,26 @@ impl Store {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn fold(&mut self, limit: usize) -> kv::Result<()> {
+        let path = self.id_to_dat_path(&self.id);
+        let file = self.files.get_mut(&self.id).unwrap();
+
+        let mut chunks = split(file, &self.base, limit)?;
+        *file = StoreFile::make(self.id, &path)?;
+        merge(file, &mut chunks)?;
+
+        let path = self.id_to_dir_path(&self.id);
+        std::fs::remove_dir_all(&path)?;
+        Ok(())
+    }
 }
 
 pub struct StoreFile {
     id: FileId,
     file: File,
     offset: u64,
+    recent_peek: Option<Record>,
 }
 
 const INSERT: u64 = 1;
@@ -121,7 +145,7 @@ const REMOVE: u64 = 2;
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FileId(u64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Record {
     Insert(Vec<u8>, Vec<u8>),
     Remove(Vec<u8>),
@@ -135,24 +159,41 @@ impl Record {
         }
     }
 
-    pub fn bytes(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
-            Record::Insert(key, val) => 8 + 16 + key.len() + val.len(),
+            Record::Insert(key, val) => 8 + 8 + key.len() + 8 + val.len(),
             Record::Remove(key) => 8 + 8 + key.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
 impl StoreFile {
-    fn open(id: FileId, path: impl AsRef<Path>) -> io::Result<Self> {
+    fn create(id: FileId, path: impl AsRef<Path>, truncate: bool) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
-            .truncate(false)
+            .truncate(truncate)
             .write(true)
             .read(true)
             .open(&path)?;
         let offset = file.metadata()?.len() as u64;
-        Ok(Self { id, file, offset })
+        Ok(Self {
+            id,
+            file,
+            offset,
+            recent_peek: None,
+        })
+    }
+
+    fn open(id: FileId, path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::create(id, path, false)
+    }
+
+    fn make(id: FileId, path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::create(id, path, true)
     }
 
     fn insert(&mut self, key: &[u8], val: &[u8]) -> io::Result<IndexEntry> {
@@ -196,7 +237,10 @@ impl StoreFile {
                 self.insert(key, val)?;
                 Ok(())
             }
-            Record::Remove(key) => self.remove(key),
+            Record::Remove(key) => {
+                self.remove(key)?;
+                Ok(())
+            }
         }
     }
 
@@ -205,6 +249,10 @@ impl StoreFile {
     }
 
     pub fn read_record(&mut self) -> io::Result<Record> {
+        if self.recent_peek.is_some() {
+            let record = self.recent_peek.take().unwrap();
+            return Ok(record);
+        }
         let mut buf = [0u8; 8];
         self.file.read_exact_at(&mut buf[..], self.offset)?;
         let op = u64::from_be_bytes(buf);
@@ -235,14 +283,19 @@ impl StoreFile {
         }
     }
 
-    pub fn peek_record(&mut self) -> io::Result<Record> {
+    pub fn peek_record(&mut self) -> io::Result<&Record> {
+        if self.recent_peek.is_some() {
+            return Ok(self.recent_peek.as_ref().unwrap());
+        }
         let record = self.read_record()?;
-        self.offset -= record.bytes() as u64;
-        Ok(record)
+        self.offset -= record.len() as u64;
+        self.recent_peek = Some(record);
+        Ok(self.recent_peek.as_ref().unwrap())
     }
 
     fn reset(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
+        self.offset = 0;
         Ok(())
     }
 }
@@ -254,39 +307,87 @@ impl Iterator for StoreFile {
     }
 }
 
-fn sort(
-    idx: &BTreeMap<Vec<u8>, IndexEntry>,
+fn split(
     src: &mut StoreFile,
-    dst: &mut StoreFile,
-) -> io::Result<BTreeMap<Vec<u8>, IndexEntry>> {
-    let mut updated: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
+    base: impl AsRef<Path>,
+    split_size_bytes: usize,
+) -> io::Result<Vec<StoreFile>> {
+    let dir = format!("{:020}", src.id.0);
+    let mut path: PathBuf = base.as_ref().to_path_buf();
+    path.push(dir);
+    std::fs::create_dir_all(&path)?;
 
-    for (key, IndexEntry { offset, length, .. }) in idx.iter() {
-        let mut val = vec![0u8; *length as usize];
-        src.read(*offset, &mut val)?;
-        let entry = dst.insert(key, &val)?;
-        updated.insert(key.to_vec(), entry);
+    let mut result = Vec::new();
+    let mut idx = 0;
+    let mut len = 0;
+    let mut map = BTreeMap::new();
+
+    fn make_file(id: FileId, base: impl AsRef<Path>) -> io::Result<StoreFile> {
+        let name = format!("{:020}.dat", id.0);
+        let mut path: PathBuf = base.as_ref().to_path_buf();
+        path.push(name);
+        StoreFile::open(id, path)
     }
 
-    Ok(updated)
-}
+    src.reset()?;
+    while let Ok(record) = src.read_record() {
+        if len + record.len() > split_size_bytes {
+            let mut file = make_file(FileId(idx), &path)?;
+            for (key, val) in map.into_iter() {
+                file.exec(&Record::Insert(key, val))?;
+            }
+            result.push(file);
+            map = BTreeMap::new();
+            len = 0;
+            idx += 1;
+        }
 
-// Both input StoreFile are expected to have entries sorted by key
-fn merge(dst: &mut StoreFile, one: &mut StoreFile, two: &mut StoreFile) -> io::Result<()> {
-    fn pick<'a>(one: &'a mut StoreFile, two: &'a mut StoreFile) -> Option<&'a mut StoreFile> {
-        match (one.peek_record().ok(), two.peek_record().ok()) {
-            (None, None) => None,
-            (Some(_), None) => Some(one),
-            (None, Some(_)) => Some(two),
-            (Some(a), Some(b)) if a.key() <= b.key() => Some(one),
-            _ => Some(two),
+        let record_len = record.len();
+        match record {
+            Record::Insert(key, val) => {
+                map.insert(key, val);
+                len += record_len;
+            }
+            Record::Remove(key) => {
+                map.remove(&key);
+            }
         }
     }
 
-    while let Some(next) = pick(one, two) {
-        let record = next.read_record()?;
-        dst.exec(&record)?;
+    if !map.is_empty() {
+        let mut file = make_file(FileId(idx), &path)?;
+        for (key, val) in map.into_iter() {
+            file.insert(&key, &val)?;
+        }
+        result.push(file);
     }
 
-    Ok(())
+    Ok(result)
+}
+
+fn merge(dst: &mut StoreFile, srcs: &mut [StoreFile]) -> io::Result<BTreeMap<Vec<u8>, IndexEntry>> {
+    fn pick(srcs: &'_ mut [StoreFile]) -> Option<&'_ mut StoreFile> {
+        srcs.iter_mut()
+            .flat_map(|src| {
+                let record_opt = src.peek_record().ok().cloned();
+                record_opt.map(|rec| (rec, src))
+            })
+            .min_by(|(a, _), (b, _)| a.key().cmp(b.key()))
+            .map(|(_, src)| src)
+    }
+
+    let mut map = BTreeMap::new();
+    while let Some(src) = pick(srcs) {
+        match src.read_record()? {
+            Record::Insert(key, val) => {
+                let index = dst.insert(&key, &val)?;
+                map.insert(key, index);
+            }
+            _ => {
+                return Err(io::Error::from(io::ErrorKind::Unsupported));
+            }
+        }
+    }
+
+    Ok(map)
 }
