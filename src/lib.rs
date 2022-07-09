@@ -64,10 +64,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> kv::Result<()> {
+    pub fn remove(&mut self, key: &[u8]) -> kv::Result<bool> {
         self.files.get_mut(&self.id).unwrap().remove(key)?;
-        self.index.remove(key);
-        Ok(())
+        Ok(self.index.remove(key).is_some())
     }
 
     pub fn lookup(&mut self, key: &[u8]) -> kv::Result<Option<Vec<u8>>> {
@@ -118,17 +117,21 @@ impl Store {
         self.len() == 0
     }
 
-    pub fn fold(&mut self, limit: usize) -> kv::Result<()> {
+    pub fn reduce(&mut self, limit: usize) -> kv::Result<()> {
         let path = self.id_to_dat_path(&self.id);
         let file = self.files.get_mut(&self.id).unwrap();
 
         let mut chunks = split(file, &self.base, limit)?;
         *file = StoreFile::make(self.id, &path)?;
-        merge(file, &mut chunks)?;
+        self.index = merge(file, &mut chunks)?;
 
         let path = self.id_to_dir_path(&self.id);
         std::fs::remove_dir_all(&path)?;
         Ok(())
+    }
+
+    pub fn file(&mut self) -> &mut StoreFile {
+        self.files.get_mut(&self.id).unwrap()
     }
 }
 
@@ -156,6 +159,13 @@ impl Record {
         match self {
             Record::Insert(key, _) => key,
             Record::Remove(key) => key,
+        }
+    }
+
+    pub fn val(&self) -> Option<&[u8]> {
+        match self {
+            Record::Insert(_, val) => Some(val),
+            Record::Remove(_) => None,
         }
     }
 
@@ -249,8 +259,8 @@ impl StoreFile {
     }
 
     pub fn read_record(&mut self) -> io::Result<Record> {
-        if self.recent_peek.is_some() {
-            let record = self.recent_peek.take().unwrap();
+        if let Some(record) = self.recent_peek.take() {
+            self.offset += record.len() as u64;
             return Ok(record);
         }
         let mut buf = [0u8; 8];
@@ -293,9 +303,15 @@ impl StoreFile {
         Ok(self.recent_peek.as_ref().unwrap())
     }
 
-    fn reset(&mut self) -> io::Result<()> {
+    pub fn reset(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.offset = 0;
+        Ok(())
+    }
+
+    pub fn unset(&mut self) -> io::Result<()> {
+        self.offset = self.file.metadata()?.len();
+        self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
 }
@@ -318,9 +334,9 @@ fn split(
     std::fs::create_dir_all(&path)?;
 
     let mut result = Vec::new();
+    let mut records = Vec::new();
     let mut idx = 0;
     let mut len = 0;
-    let mut map = BTreeMap::new();
 
     fn make_file(id: FileId, base: impl AsRef<Path>) -> io::Result<StoreFile> {
         let name = format!("{:020}.dat", id.0);
@@ -329,37 +345,40 @@ fn split(
         StoreFile::open(id, path)
     }
 
+    fn dump_file(file: &mut StoreFile, mut records: Vec<Record>) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        records.sort_by(|a, b| a.key().cmp(b.key()));
+        for record in records {
+            file.exec(&record)?;
+        }
+        file.file.flush()?;
+        Ok(())
+    }
+
     src.reset()?;
     while let Ok(record) = src.read_record() {
         if len + record.len() > split_size_bytes {
             let mut file = make_file(FileId(idx), &path)?;
-            for (key, val) in map.into_iter() {
-                file.exec(&Record::Insert(key, val))?;
-            }
+            dump_file(&mut file, records)?;
             result.push(file);
-            map = BTreeMap::new();
+            records = Vec::new();
             len = 0;
             idx += 1;
         }
 
-        let record_len = record.len();
-        match record {
-            Record::Insert(key, val) => {
-                map.insert(key, val);
-                len += record_len;
-            }
-            Record::Remove(key) => {
-                map.remove(&key);
-            }
-        }
+        len += record.len();
+        records.push(record);
     }
 
-    if !map.is_empty() {
-        let mut file = make_file(FileId(idx), &path)?;
-        for (key, val) in map.into_iter() {
-            file.insert(&key, &val)?;
-        }
-        result.push(file);
+    let mut file = make_file(FileId(idx), &path)?;
+    dump_file(&mut file, records)?;
+    result.push(file);
+
+    for src in result.iter_mut() {
+        src.file.flush()?;
+        src.reset()?;
     }
 
     Ok(result)
@@ -368,26 +387,36 @@ fn split(
 fn merge(dst: &mut StoreFile, srcs: &mut [StoreFile]) -> io::Result<BTreeMap<Vec<u8>, IndexEntry>> {
     fn pick(srcs: &'_ mut [StoreFile]) -> Option<&'_ mut StoreFile> {
         srcs.iter_mut()
-            .flat_map(|src| {
-                let record_opt = src.peek_record().ok().cloned();
-                record_opt.map(|rec| (rec, src))
-            })
+            .flat_map(|src| src.peek_record().ok().cloned().map(|rec| (rec, src)))
             .min_by(|(a, _), (b, _)| a.key().cmp(b.key()))
             .map(|(_, src)| src)
     }
 
-    let mut map = BTreeMap::new();
+    let mut index = BTreeMap::new();
+    let mut current_key: Option<Vec<u8>> = None;
+    let mut current_val: Option<Vec<u8>> = None;
     while let Some(src) = pick(srcs) {
-        match src.read_record()? {
-            Record::Insert(key, val) => {
-                let index = dst.insert(&key, &val)?;
-                map.insert(key, index);
-            }
-            _ => {
-                return Err(io::Error::from(io::ErrorKind::Unsupported));
-            }
+        let record = src.read_record()?;
+        if current_key.is_none() {
+            current_key = Some(record.key().to_vec());
         }
+        if record.key() != current_key.as_ref().unwrap() {
+            if current_val.is_some() {
+                let key = current_key.as_ref().unwrap();
+                let val = current_val.as_ref().unwrap();
+                let entry = dst.insert(key, val)?;
+                index.insert(current_key.as_ref().unwrap().to_vec(), entry);
+            }
+            current_key = Some(record.key().to_vec());
+        }
+        current_val = record.val().map(|slice| slice.to_vec());
     }
 
-    Ok(map)
+    if current_val.is_some() {
+        let entry = dst.insert(current_key.as_ref().unwrap(), current_val.as_ref().unwrap())?;
+        index.insert(current_key.as_ref().unwrap().to_vec(), entry);
+    }
+
+    dst.file.flush()?;
+    Ok(index)
 }

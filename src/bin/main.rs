@@ -1,25 +1,11 @@
-use yalskv::util;
-use yalskv::{kv, Store};
+use yalskv::util::{self, hex};
+use yalskv::{kv, Record, Store};
 
 use std::time::SystemTime;
 
 fn main() -> kv::Result<()> {
     std::fs::create_dir_all("target/db")?;
     let mut store = Store::open("target/db")?;
-
-    let key = b"https://www.lipsum.com/feed/html";
-    let val = b"[Neque porro quisquam est qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit...]";
-
-    store.insert(key, val)?;
-    println!(
-        "{:?}",
-        &store
-            .lookup(key)?
-            .as_ref()
-            .map(|bytes| String::from_utf8_lossy(bytes))
-    );
-    store.remove(key)?;
-    println!("{:?}", store.lookup(key)?);
 
     const N: usize = 1000000;
     let now = SystemTime::now();
@@ -29,18 +15,63 @@ fn main() -> kv::Result<()> {
         store.insert(key, val)?;
     }
 
-    let data = util::shuffle(data, 142);
-    for (key, _) in data.iter() {
-        store.remove(key)?;
-    }
-
-    let ms = now.elapsed().unwrap().as_millis() as usize;
-    let op = N * 2 * 1000 / ms;
-    let kb = N * 1000 * (64 * 3) / ms / 1024;
+    let ms = (now.elapsed().unwrap().as_millis() as usize).max(1);
+    let op = N * 1000 / ms;
+    let kb = N * 1000 * (64 + 64) / ms / 1024;
     println!("n={} ms={} op={} kb={}", N, ms, op, kb);
+    println!("insert: ok");
 
-    let limit = 4 * 1024 * 1024;
-    store.fold(limit)?;
+    let limit = 1024 * 1024 * 32;
+    store.reduce(limit)?;
+    println!("reduce: ok");
+
+    let data = util::shuffle(data, 1);
+    for (key, value) in data.iter() {
+        if let Some(stored) = store.lookup(key)? {
+            if &stored != value {
+                eprintln!("!match: key={}", hex(key));
+            }
+        } else {
+            eprintln!("!found: key={}", hex(key));
+        }
+    }
+    println!("lookup: ok");
+
+    store.file().reset()?;
+    let mut prev: Option<Record> = None;
+    for (i, next) in store.file().enumerate() {
+        if prev.is_none() {
+            prev = Some(next);
+            continue;
+        }
+
+        if prev.as_ref().unwrap().key() > next.key() {
+            println!(
+                "!sorted (i={}):\n\tprev={}\n\tnext={}",
+                i,
+                hex(prev.as_ref().unwrap().key()),
+                hex(next.key())
+            );
+        }
+        prev = Some(next);
+    }
+    println!("sorted: ok");
+
+    store.file().unset()?;
+    let data = util::shuffle(data, 2);
+    for (key, _) in data.iter() {
+        if !store.remove(key)? {
+            eprintln!("!exist: key={}", hex(key));
+        }
+    }
+    store.reduce(limit)?;
+
+    store.file().reset()?;
+    let count = store.file().count();
+    if count > 0 {
+        eprintln!("!empty: {}", count);
+    }
+    println!("remove: ok");
 
     Ok(())
 }
