@@ -1,4 +1,4 @@
-use yalskv::util::{self, hex};
+use yalskv::util::{data, hex, mix};
 use yalskv::{kv, Record, Store};
 
 use std::time::SystemTime;
@@ -10,14 +10,14 @@ fn main() -> kv::Result<()> {
     const N: usize = 1000000;
     let now = SystemTime::now();
 
-    let data = util::data(N, 42);
+    let data = data(N, 42);
     for (key, val) in data.iter() {
         store.insert(key, val)?;
     }
 
     let ms = (now.elapsed().unwrap().as_millis() as usize).max(1);
     let op = N * 1000 / ms;
-    let kb = N * 1000 * (64 + 64) / ms / 1024;
+    let kb = N * 1000 * (64 + 64 + 3 * 8) / ms / 1024;
     println!("n={} ms={} op={} kb={}", N, ms, op, kb);
     println!("insert: ok");
 
@@ -25,7 +25,7 @@ fn main() -> kv::Result<()> {
     store.reduce(limit)?;
     println!("reduce: ok");
 
-    let data = util::shuffle(data, 1);
+    let data = mix(data, 1);
     for (key, value) in data.iter() {
         if let Some(stored) = store.lookup(key)? {
             if &stored != value {
@@ -58,7 +58,7 @@ fn main() -> kv::Result<()> {
     println!("sorted: ok");
 
     store.file().unset()?;
-    let data = util::shuffle(data, 2);
+    let data = mix(data, 2);
     for (key, _) in data.iter() {
         if !store.remove(key)? {
             eprintln!("!exist: key={}", hex(key));

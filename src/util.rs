@@ -7,9 +7,9 @@ pub fn data(count: usize, seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
     (0..count)
         .into_iter()
         .map(|_| {
-            let mut key = Vec::with_capacity(32);
-            let mut val = Vec::with_capacity(32);
-            for _ in 0..4 {
+            let mut key = Vec::with_capacity(64);
+            let mut val = Vec::with_capacity(64);
+            for _ in 0..8 {
                 key.extend_from_slice(&rng.next_u64().to_be_bytes());
                 val.extend_from_slice(&rng.next_u64().to_be_bytes());
             }
@@ -18,7 +18,7 @@ pub fn data(count: usize, seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-pub fn shuffle<T>(mut data: Vec<T>, seed: u64) -> Vec<T> {
+pub fn mix<T>(mut data: Vec<T>, seed: u64) -> Vec<T> {
     let mut rng = StdRng::seed_from_u64(seed);
     data.shuffle(&mut rng);
     data
