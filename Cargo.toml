@@ -2,6 +2,12 @@
 name = "yalskv"
 version = "0.1.0"
 edition = "2021"
+authors = ["sergey-melnychuk"]
+description = "Yet Another Log-Structured Kev-Value data store"
+license = "MIT"
+homepage = "https://github.com/sergey-melnychuk/yalskv"
+repository = "https://github.com/sergey-melnychuk/yalskv"
+documentation = "https://github.com/sergey-melnychuk/yalskv"
 
 # sudo sh -c "echo -1 > /proc/sys/kernel/perf_event_paranoid"
 # sudo sh -c "echo 0 > /proc/sys/kernel/kptr_restrict"
