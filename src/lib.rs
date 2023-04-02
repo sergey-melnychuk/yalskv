@@ -171,8 +171,14 @@ impl Record {
 
     pub fn len(&self) -> usize {
         match self {
-            Record::Insert(key, val) => 8 + 8 + key.len() + 8 + val.len(),
-            Record::Remove(key) => 8 + 8 + key.len(),
+            Record::Insert(key, val) => 
+                std::mem::size_of::<u64>()
+                + 2 * std::mem::size_of::<u32>() 
+                + key.len() + val.len(),
+            Record::Remove(key) => 
+                std::mem::size_of::<u64>() 
+                + std::mem::size_of::<u32>() 
+                + key.len(),
         }
     }
 
@@ -207,9 +213,9 @@ impl StoreFile {
     }
 
     fn insert(&mut self, key: &[u8], val: &[u8]) -> io::Result<IndexEntry> {
-        let key_len = key.len() as u64;
-        let val_len = val.len() as u64;
-        self.file.seek(SeekFrom::Start(self.offset))?;
+        let key_len = key.len() as u32;
+        let val_len = val.len() as u32;
+        //self.file.seek(SeekFrom::Start(self.offset))?;
         self.file.write_all(&INSERT.to_be_bytes())?;
         self.file.write_all(&key_len.to_be_bytes())?;
         self.file.write_all(&val_len.to_be_bytes())?;
@@ -217,25 +223,27 @@ impl StoreFile {
         self.file.write_all(val)?;
         self.file.flush()?;
 
-        self.offset += std::mem::size_of::<u64>() as u64 * 3 + key_len + val_len;
-        let offset = self.offset - val_len;
+        let length = std::mem::size_of::<u64>() as u64 
+            + 2 * std::mem::size_of::<u32>() as u64 
+            + key_len as u64 + val_len as u64;
+        self.offset += length;
 
         Ok(IndexEntry {
             file: self.id,
-            offset,
-            length: val_len,
+            offset: self.offset - val_len as u64,
+            length: val_len as u64,
         })
     }
 
     fn remove(&mut self, key: &[u8]) -> io::Result<()> {
-        let key_len = key.len() as u64;
-        self.file.seek(SeekFrom::Start(self.offset))?;
+        let key_len = key.len() as u32;
+        //self.file.seek(SeekFrom::Start(self.offset))?;
         self.file.write_all(&REMOVE.to_be_bytes())?;
         self.file.write_all(&key_len.to_be_bytes())?;
         self.file.write_all(key)?;
         self.file.flush()?;
 
-        let length = std::mem::size_of::<u64>() as u64 * 2 + key_len;
+        let length = std::mem::size_of::<u64>() as u64 + std::mem::size_of::<u32>() as u64 + key_len as u64;
         self.offset += length;
 
         Ok(())
@@ -255,7 +263,10 @@ impl StoreFile {
     }
 
     fn read(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(buffer, offset)
+        let pos = self.file.stream_position()?;
+        self.file.read_exact_at(buffer, offset)?;
+        self.file.seek(SeekFrom::Start(pos))?;
+        Ok(())
     }
 
     pub fn read_record(&mut self) -> io::Result<Record> {
@@ -267,26 +278,26 @@ impl StoreFile {
         self.file.read_exact_at(&mut buf[..], self.offset)?;
         let op = u64::from_be_bytes(buf);
 
-        self.file.read_exact_at(&mut buf[..], self.offset + 8)?;
-        let key_len = u64::from_be_bytes(buf);
+        self.file.read_exact_at(&mut buf[0..4], self.offset + 8)?;
+        let key_len = u32::from_be_bytes(buf[0..4].try_into().unwrap());
 
         // TODO Add sanity check for max key/value length
         match op {
             INSERT => {
-                self.file.read_exact_at(&mut buf[..], self.offset + 16)?;
-                let val_len = u64::from_be_bytes(buf);
+                self.file.read_exact_at(&mut buf[4..8], self.offset + 12)?;
+                let val_len = u32::from_be_bytes(buf[4..8].try_into().unwrap());
 
                 let mut buf = vec![0u8; (key_len + val_len) as usize];
-                self.file.read_exact_at(&mut buf[..], self.offset + 24)?;
-                self.offset += 24 + key_len + val_len;
+                self.file.read_exact_at(&mut buf[..], self.offset + 16)?;
+                self.offset += 16 + key_len as u64 + val_len as u64;
 
                 let val = buf.split_off(key_len as usize);
                 Ok(Record::Insert(buf, val))
             }
             REMOVE => {
                 let mut buf = vec![0u8; key_len as usize];
-                self.file.read_exact_at(&mut buf[..], self.offset + 16)?;
-                self.offset += 16 + key_len;
+                self.file.read_exact_at(&mut buf[..], self.offset + 12)?;
+                self.offset += 12 + key_len as u64;
                 Ok(Record::Remove(buf))
             }
             _ => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
